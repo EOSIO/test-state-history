@@ -1,0 +1,14 @@
+{
+  "name": "test-state",
+  "version": "1.0.0",
+  "main": "index.js",
+  "author": "<todd.fleming@block.one>",
+  "license": "MIT",
+  "dependencies": {
+    "eosjs2": "/Users/toddfleming/eosjs2",
+    "node-fetch": "^2.2.0",
+    "pg": "^7.4.3",
+    "text-encoding": "^0.6.4",
+    "ws": "^6.0.0"
+  }
+}
