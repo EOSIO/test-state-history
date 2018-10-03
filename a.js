@@ -191,7 +191,7 @@ class MonitorTransfers {
         return t.deserialize(buffer, new Serialize.SerializerState({ bytesAsUint8Array: false }));
     }
 
-    account_index(blockNum, delta) {
+    account(blockNum, delta) {
         this.connection.forEachRow(delta, (id, data) => {
             if (!data || data.name !== 'eosio.token')
                 return;
@@ -199,7 +199,7 @@ class MonitorTransfers {
         });
     }
 
-    table_id_multi_index(blockNum, delta) {
+    table_id(blockNum, delta) {
         this.connection.forEachRow(delta, (id, data) => {
             if (!data)
                 this.tableIds.delete(id);
@@ -208,7 +208,7 @@ class MonitorTransfers {
         });
     }
 
-    key_value_index(blockNum, delta) {
+    key_value(blockNum, delta) {
         this.connection.forEachRow(delta, (id, data) => {
             if (!data)
                 return;
