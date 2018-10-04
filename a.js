@@ -5,6 +5,8 @@ const { TextDecoder, TextEncoder } = require('text-encoding');
 const abiAbi = require('./node_modules/eosjs2/src/abi.abi.json');
 const pg = require('pg');
 
+const schema = 'chain';
+
 const abiTypes = Serialize.getTypesFromAbi(Serialize.createInitialTypes(), abiAbi);
 
 const sqlTypes = {
@@ -222,12 +224,11 @@ class MonitorTransfers {
     }
 } // MonitorTransfers
 
-// let foo = new MonitorTransfers;
-
 class FillPostgress {
     constructor() {
         this.pool = new pg.Pool;
         this.sqlTables = new Map;
+        this.numRows = 0;
 
         this.connection = new Connection({
             receivedAbi: () => this.createDatabase(),
@@ -238,10 +239,10 @@ class FillPostgress {
     async createDatabase() {
         try {
             try {
-                await this.pool.query(`drop schema chain cascade`);
+                await this.pool.query(`drop schema ${schema} cascade`);
             } catch (e) {
             }
-            await this.pool.query(`create schema chain`);
+            await this.pool.query(`create schema ${schema}`);
 
             for (let abiTable of this.connection.abi.tables) {
                 const type = Serialize.getType(this.connection.types, abiTable.type).fields[0].type;
@@ -258,8 +259,8 @@ class FillPostgress {
                 sqlTable.fields.splice(0, 0, { name: 'block_index', type: { name: 'bigint', convert: x => x } });
                 let fieldNames = sqlTable.fields.map(({ name }) => `"${name}"`).join(', ');
                 let values = [...Array(sqlTable.fields.length).keys()].map(n => `$${n + 1}`).join(',');
-                sqlTable.insert = `insert into chain.${sqlTable.name}(${fieldNames}) values (${values})`;
-                let query = `create table chain.${sqlTable.name} (${sqlTable.fields.map(({ name, type }) => `"${name}" ${type.name}`).join(', ')}, primary key(block_index, id));`;
+                sqlTable.insert = `insert into ${schema}.${sqlTable.name}(${fieldNames}) values (${values})`;
+                let query = `create table ${schema}.${sqlTable.name} (${sqlTable.fields.map(({ name, type }) => `"${name}" ${type.name}`).join(', ')}, primary key(block_index, id));`;
                 await this.pool.query(query);
             }
 
@@ -270,8 +271,12 @@ class FillPostgress {
     }
 
     async receivedBlock(message, deltas) {
-        if (!(message.block_num % 100))
+        if (!(message.block_num % 100)) {
+            if (this.numRows)
+                console.log(`    created ${numberWithCommas(this.numRows)} rows`);
+            this.numRows = 0;
             console.log(`block ${numberWithCommas(message.block_num)}`)
+        }
         await this.pool.query('start transaction;');
         for (let [_, delta] of deltas) {
             let sqlTable = this.sqlTables.get(delta.name);
@@ -286,6 +291,7 @@ class FillPostgress {
             for (let [query, value] of queries) {
                 try {
                     await this.pool.query(query, value);
+                    this.numRows += queries.length;
                 } catch (e) {
                     console.log(query, value);
                     console.log(e);
@@ -296,4 +302,5 @@ class FillPostgress {
     }
 } // FillPostgress
 
+// let foo = new MonitorTransfers;
 let foo = new FillPostgress;
