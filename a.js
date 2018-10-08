@@ -39,8 +39,7 @@ function numberWithCommas(x) {
 
 class Connection {
     constructor({ receivedAbi, receivedBlock }) {
-        // todo: initial state (block 1)
-        this.last_block_num = 0;
+        this.end_block_num = 0;
         this.last_requested = 1;
         this.last_processed = 1;
         this.skip_from = -1;
@@ -91,12 +90,12 @@ class Connection {
         }
     }
 
-    requestState() {
-        this.send(['get_state_request_v0', {}]);
+    requestStatus() {
+        this.send(['get_status_request_v0', {}]);
     }
 
     requestBlocks() {
-        for (let block_num = this.last_requested + 1; block_num <= this.last_processed + this.simultaneous && block_num <= this.last_block_num; ++block_num) {
+        for (let block_num = this.last_requested + 1; block_num <= this.last_processed + this.simultaneous && block_num < this.end_block_num; ++block_num) {
             this.send(['get_block_request_v0', { block_num }]);
             this.last_requested = block_num;
             if (this.last_requested == this.skip_from)
@@ -123,8 +122,8 @@ class Connection {
         this.requestBlocks();
     }
 
-    get_state_result_v0(response) {
-        this.last_block_num = response.last_block_num;
+    get_status_result_v0(response) {
+        this.end_block_num = response.state_end_block_num;
         this.requestBlocks();
     }
 
@@ -162,8 +161,10 @@ class MonitorTransfers {
         this.tableIds = new Map;
 
         this.connection = new Connection({
-            receivedAbi: () => this.connection.requestState(),
+            receivedAbi: () => this.connection.requestStatus(),
             receivedBlock: async (message, deltas) => {
+                if (!(message.block_num % 100))
+                    console.log(`block ${numberWithCommas(message.block_num)}`)
                 for (let [_, delta] of deltas)
                     if (this[delta.name])
                         this[delta.name](message.block_num, delta);
@@ -256,7 +257,9 @@ class FillPostgress {
                         sqlTable.fields.push({ name: field.name, type: sqlType });
                     }
                 }
-                sqlTable.fields.splice(0, 0, { name: 'block_index', type: { name: 'bigint', convert: x => x } });
+                sqlTable.fields.splice(0, 0,
+                    { name: 'block_index', type: { name: 'bigint', convert: x => x } },
+                    { name: 'present', type: { name: 'boolean', convert: x => x } });
                 let fieldNames = sqlTable.fields.map(({ name }) => `"${name}"`).join(', ');
                 let values = [...Array(sqlTable.fields.length).keys()].map(n => `$${n + 1}`).join(',');
                 sqlTable.insert = `insert into ${schema}.${sqlTable.name}(${fieldNames}) values (${values})`;
@@ -264,7 +267,7 @@ class FillPostgress {
                 await this.pool.query(query);
             }
 
-            this.connection.requestState();
+            this.connection.requestStatus();
         } catch (e) {
             console.log(e);
         }
@@ -282,11 +285,14 @@ class FillPostgress {
             let sqlTable = this.sqlTables.get(delta.name);
             let queries = [];
             this.connection.forEachRow(delta, (id, data) => {
-                if (!data)
-                    return;
-                let values = sqlTable.fields.map(({ name, type }) => type.convert(data[name]));
-                values[0] = message.block_num;
-                queries.push([sqlTable.insert, values]);
+                if (data) {
+                    let values = sqlTable.fields.map(({ name, type }) => type.convert(data[name]));
+                    values[0] = message.block_num;
+                    values[1] = true;
+                    queries.push([sqlTable.insert, values]);
+                } else {
+                    queries.push([`insert into ${schema}.${sqlTable.name}(block_index, present, id) values (${message.block_num}, false, ${id});`]);
+                }
             });
             for (let [query, value] of queries) {
                 try {
