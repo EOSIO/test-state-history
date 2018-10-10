@@ -115,8 +115,12 @@ class Connection {
             this.last_processed = response.block_num;
             if (this.last_processed == this.skip_from)
                 this.last_processed = this.skip_to;
-            const deltas = this.deserialize('table_delta[]', response.deltas);
-            await this.receivedBlock(response, deltas);
+            let deltas = [], traces = [];
+            if (response.deltas.length)
+                deltas = this.deserialize('table_delta[]', response.deltas);
+            if (response.traces.length)
+                traces = this.deserialize('transaction_trace[]', response.traces);
+            await this.receivedBlock(response, deltas, traces);
         }
         this.inProcessBlockStates = false;
         this.requestBlocks();
@@ -162,9 +166,15 @@ class MonitorTransfers {
 
         this.connection = new Connection({
             receivedAbi: () => this.connection.requestStatus(),
-            receivedBlock: async (message, deltas) => {
+            receivedBlock: async (message, deltas, traces) => {
                 if (!(message.block_num % 100))
                     console.log(`block ${numberWithCommas(message.block_num)}`)
+                // if (traces.length)
+                //     console.log(JSON.stringify(traces, (k, v) => {
+                //         if (v instanceof Uint8Array)
+                //             return "...";
+                //         return v;
+                //     }, 4));
                 for (let [_, delta] of deltas)
                     if (this[delta.name])
                         this[delta.name](message.block_num, delta);
