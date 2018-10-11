@@ -37,6 +37,14 @@ function numberWithCommas(x) {
     return x.toString().replace(/\B(?=(\d{3})+(?!\d))/g, ",");
 }
 
+function toJsonNoBin(x) {
+    return JSON.stringify(x, (k, v) => {
+        if (v instanceof Uint8Array)
+            return "...";
+        return v;
+    }, 4)
+}
+
 class Connection {
     constructor({ receivedAbi, receivedBlock }) {
         this.end_block_num = 0;
@@ -68,7 +76,7 @@ class Connection {
         const buffer = new Serialize.SerialBuffer({ textEncoder: new TextEncoder, textDecoder: new TextDecoder, array });
         let result = Serialize.getType(this.types, type).deserialize(buffer, new Serialize.SerializerState({ bytesAsUint8Array: true }));
         if (buffer.readPos != array.length)
-            throw new Error('oops'); // todo: remove check
+            throw new Error('oops', type); // todo: remove check
         return result;
     }
 
@@ -78,7 +86,7 @@ class Connection {
 
     async onMessage(data) {
         if (!this.abi) {
-            this.abi = JSON.parse((new TextDecoder).decode(data));
+            this.abi = JSON.parse(data);
             this.types = Serialize.getTypesFromAbi(Serialize.createInitialTypes(), this.abi);
             for (const table of this.abi.tables)
                 this.tables.set(table.name, table.type);
@@ -115,12 +123,14 @@ class Connection {
             this.last_processed = response.block_num;
             if (this.last_processed == this.skip_from)
                 this.last_processed = this.skip_to;
-            let deltas = [], traces = [];
-            if (response.deltas.length)
-                deltas = this.deserialize('table_delta[]', response.deltas);
+            let block, traces = [], deltas = [];
+            if (response.block.length)
+                block = this.deserialize('signed_block', response.block);
             if (response.traces.length)
                 traces = this.deserialize('transaction_trace[]', response.traces);
-            await this.receivedBlock(response, deltas, traces);
+            if (response.deltas.length)
+                deltas = this.deserialize('table_delta[]', response.deltas);
+            await this.receivedBlock(response, block, traces, deltas);
         }
         this.inProcessBlockStates = false;
         this.requestBlocks();
@@ -166,18 +176,16 @@ class MonitorTransfers {
 
         this.connection = new Connection({
             receivedAbi: () => this.connection.requestStatus(),
-            receivedBlock: async (message, deltas, traces) => {
-                if (!(message.block_num % 100))
-                    console.log(`block ${numberWithCommas(message.block_num)}`)
+            receivedBlock: async (response, block, traces, deltas) => {
+                if (!(response.block_num % 100))
+                    console.log(`block ${numberWithCommas(response.block_num)}`)
+                // if (block)
+                //     console.log(toJsonNoBin(block));
                 // if (traces.length)
-                //     console.log(JSON.stringify(traces, (k, v) => {
-                //         if (v instanceof Uint8Array)
-                //             return "...";
-                //         return v;
-                //     }, 4));
+                //     console.log(toJsonNoBin(traces));
                 for (let [_, delta] of deltas)
                     if (this[delta.name])
-                        this[delta.name](message.block_num, delta);
+                        this[delta.name](response.block_num, delta);
             }
         });
     }
@@ -283,12 +291,12 @@ class FillPostgress {
         }
     }
 
-    async receivedBlock(message, deltas) {
-        if (!(message.block_num % 100)) {
+    async receivedBlock(response, block, traces, deltas) {
+        if (!(response.block_num % 100)) {
             if (this.numRows)
                 console.log(`    created ${numberWithCommas(this.numRows)} rows`);
             this.numRows = 0;
-            console.log(`block ${numberWithCommas(message.block_num)}`)
+            console.log(`block ${numberWithCommas(response.block_num)}`)
         }
         await this.pool.query('start transaction;');
         for (let [_, delta] of deltas) {
@@ -297,11 +305,11 @@ class FillPostgress {
             this.connection.forEachRow(delta, (id, data) => {
                 if (data) {
                     let values = sqlTable.fields.map(({ name, type }) => type.convert(data[name]));
-                    values[0] = message.block_num;
+                    values[0] = response.block_num;
                     values[1] = true;
                     queries.push([sqlTable.insert, values]);
                 } else {
-                    queries.push([`insert into ${schema}.${sqlTable.name}(block_index, present, id) values (${message.block_num}, false, ${id});`]);
+                    queries.push([`insert into ${schema}.${sqlTable.name}(block_index, present, id) values (${response.block_num}, false, ${id});`]);
                 }
             });
             for (let [query, value] of queries) {
