@@ -156,15 +156,13 @@ class Connection {
                 console.error(e);
             }
             if (data)
-                f(row.id, data[1]);
+                f(row.present, data[1]);
         }
-        for (let id of delta.removed)
-            f(id, null);
     }
 
     dumpDelta(delta) {
-        this.forEachRow(delta, (id, data) => {
-            console.log('   ', id, JSON.stringify(data));
+        this.forEachRow(delta, (present, data) => {
+            console.log('   ', present, JSON.stringify(data));
         });
     }
 } // Connection
@@ -190,55 +188,43 @@ class MonitorTransfers {
         });
     }
 
-    getAccountTypes(name) {
-        let account = this.accounts.get(name);
-        if (!account || !account.abi.length)
-            throw new Error('x');
-        if (account.types)
-            return account.types;
-        const abi = abiTypes.get("abi_def").deserialize(new Serialize.SerialBuffer({ textEncoder: new TextEncoder, textDecoder: new TextDecoder, array: account.abi }));
-        account.types = Serialize.getTypesFromAbi(Serialize.createInitialTypes(), abi);
-        return account.types;
+    getAccount(name) {
+        const account = this.accounts.get(name);
+        if (!account || !account.rawAbi.length)
+            throw new Error('no abi for ' + name);
+        if (!account.abi)
+            account.abi = abiTypes.get("abi_def").deserialize(new Serialize.SerialBuffer({ textEncoder: new TextEncoder, textDecoder: new TextDecoder, array: account.rawAbi }));
+        if (!account.types)
+            account.types = Serialize.getTypesFromAbi(Serialize.createInitialTypes(), account.abi);
+        return account;
     }
 
-    deserializeAccount(name, type, array) {
-        const types = this.getAccountTypes(name);
-        if (!types)
-            throw new Error('a');
-        const t = Serialize.getType(types, type);
-        if (!t)
-            throw new Error('b');
+    deserializeTable(name, tableName, array) {
+        const account = this.getAccount(name);
+        const typeName = account.abi.tables.find(t => t.name == tableName).type;
+        const type = Serialize.getType(account.types, typeName);
         const buffer = new Serialize.SerialBuffer({ textEncoder: new TextEncoder, textDecoder: new TextDecoder, array });
-        return t.deserialize(buffer, new Serialize.SerializerState({ bytesAsUint8Array: false }));
+        return type.deserialize(buffer, new Serialize.SerializerState({ bytesAsUint8Array: false }));
     }
 
     account(blockNum, delta) {
-        this.connection.forEachRow(delta, (id, data) => {
-            if (!data || data.name !== 'eosio.token')
-                return;
-            this.accounts.set(data.name, { abi: data.abi });
+        this.connection.forEachRow(delta, (present, data) => {
+            if (present && data.abi.length) {
+                console.log(`block: ${blockNum} ${data.name}: set abi`);
+                this.accounts.set(data.name, { rawAbi: data.abi });
+            } else if (this.accounts.has(data.name)) {
+                console.log(`block: ${blockNum} ${data.name}: clear abi`);
+                this.accounts.delete(data.name);
+            }
         });
     }
 
-    table_id(blockNum, delta) {
-        this.connection.forEachRow(delta, (id, data) => {
-            if (!data)
-                this.tableIds.delete(id);
-            else if (data.code === 'eosio.token' && data.table === 'accounts')
-                this.tableIds.set(data.id, data);
-        });
-    }
-
-    key_value(blockNum, delta) {
-        this.connection.forEachRow(delta, (id, data) => {
-            if (!data)
+    contract_row(blockNum, delta) {
+        this.connection.forEachRow(delta, (present, data) => {
+            if (data.code !== 'eosio.token' && data.table !== 'accounts' || data.scope !== 'eosio')
                 return;
-            let tableId = this.tableIds.get(data.t_id);
-            if (!tableId)
-                return;
-            if (tableId.scope !== 'eosio')
-                return;
-            console.log(`block: ${blockNum} tid: ${data.t_id} id:${data.id} code:${tableId.code} scope:${tableId.scope} table:${tableId.table} table_payer:${tableId.payer} payer:${data.payer} primary_key:${data.primary_key}  ${JSON.stringify(this.deserializeAccount(tableId.code, 'account', data.value))}`);
+            let content = this.deserializeTable(data.code, data.table, data.value);
+            console.log(`block: ${blockNum} present: ${present} code:${data.code} scope:${data.scope} table:${data.table} table_payer:${data.payer} payer:${data.payer} primary_key:${data.primary_key}  ${JSON.stringify(content)}`);
         });
     }
 } // MonitorTransfers
@@ -281,7 +267,9 @@ class FillPostgress {
                 let fieldNames = sqlTable.fields.map(({ name }) => `"${name}"`).join(', ');
                 let values = [...Array(sqlTable.fields.length).keys()].map(n => `$${n + 1}`).join(',');
                 sqlTable.insert = `insert into ${schema}.${sqlTable.name}(${fieldNames}) values (${values})`;
-                let query = `create table ${schema}.${sqlTable.name} (${sqlTable.fields.map(({ name, type }) => `"${name}" ${type.name}`).join(', ')}, primary key(block_index, id));`;
+                let pk = '"block_index"' + abiTable.key_names.map(x => ',"' + x + '"').join('');
+                let query = `create table ${schema}.${sqlTable.name} (${sqlTable.fields.map(({ name, type }) => `"${name}" ${type.name}`).join(', ')}, primary key(${pk}));`;
+
                 await this.pool.query(query);
             }
 
@@ -302,15 +290,11 @@ class FillPostgress {
         for (let [_, delta] of deltas) {
             let sqlTable = this.sqlTables.get(delta.name);
             let queries = [];
-            this.connection.forEachRow(delta, (id, data) => {
-                if (data) {
-                    let values = sqlTable.fields.map(({ name, type }) => type.convert(data[name]));
-                    values[0] = response.block_num;
-                    values[1] = true;
-                    queries.push([sqlTable.insert, values]);
-                } else {
-                    queries.push([`insert into ${schema}.${sqlTable.name}(block_index, present, id) values (${response.block_num}, false, ${id});`]);
-                }
+            this.connection.forEachRow(delta, (present, data) => {
+                let values = sqlTable.fields.map(({ name, type }) => type.convert(data[name]));
+                values[0] = response.block_num;
+                values[1] = present;
+                queries.push([sqlTable.insert, values]);
             });
             for (let [query, value] of queries) {
                 try {
