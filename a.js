@@ -4,6 +4,7 @@ const fetch = require('node-fetch');
 const { TextDecoder, TextEncoder } = require('text-encoding');
 const abiAbi = require('./node_modules/eosjs2/src/abi.abi.json');
 const pg = require('pg');
+const zlib = require('zlib');
 
 const schema = 'chain';
 
@@ -48,10 +49,10 @@ function toJsonNoBin(x) {
 class Connection {
     constructor({ receivedAbi, receivedBlock }) {
         this.end_block_num = 0;
-        this.last_requested = 1;
-        this.last_processed = 1;
-        this.skip_from = -1;
-        this.skip_to = 1293913;
+        this.lastRequested = 1;
+        this.lastProcessed = 1;
+        this.skipFrom = -1;
+        this.skipTo = 18000000;
         this.simultaneous = 10;
         this.inProcessBlockStates = false;
         this.receivedAbi = receivedAbi;
@@ -76,8 +77,29 @@ class Connection {
         const buffer = new Serialize.SerialBuffer({ textEncoder: new TextEncoder, textDecoder: new TextDecoder, array });
         let result = Serialize.getType(this.types, type).deserialize(buffer, new Serialize.SerializerState({ bytesAsUint8Array: true }));
         if (buffer.readPos != array.length)
-            throw new Error('oops', type); // todo: remove check
+            throw new Error('oops: ' + type); // todo: remove check
+        // {
+        //     console.log(result.actions[0].authorization[0].actor);
+        //     //console.log('oops: ' + type);
+        // }
         return result;
+    }
+
+    toJsonUnpackTransaction(x) {
+        return JSON.stringify(x, (k, v) => {
+            if (k === 'trx' && Array.isArray(v) && v[0] === 'packed_transaction') {
+                const pt = v[1];
+                let packed_trx = pt.packed_trx;
+                if (pt.compression === 0)
+                    packed_trx = this.deserialize('transaction', packed_trx);
+                else if (pt.compression === 1)
+                    packed_trx = this.deserialize('transaction', zlib.unzipSync(packed_trx));
+                return { ...pt, packed_trx };
+            }
+            if (v instanceof Uint8Array)
+                return "...";
+            return v;
+        }, 4)
     }
 
     send(request) {
@@ -103,11 +125,13 @@ class Connection {
     }
 
     requestBlocks() {
-        for (let block_num = this.last_requested + 1; block_num <= this.last_processed + this.simultaneous && block_num < this.end_block_num; ++block_num) {
+        for (let block_num = this.lastRequested + 1; block_num <= this.lastProcessed + this.simultaneous && block_num < this.end_block_num; ++block_num) {
             this.send(['get_block_request_v0', { block_num }]);
-            this.last_requested = block_num;
-            if (this.last_requested == this.skip_from)
-                this.last_requested = this.skip_to;
+            this.lastRequested = block_num;
+            if (this.lastRequested == this.skipFrom) {
+                this.lastRequested = this.skipTo;
+                break;
+            }
         }
     }
 
@@ -116,13 +140,13 @@ class Connection {
             return;
         this.inProcessBlockStates = true;
         while (true) {
-            let response = this.blockStates.get(this.last_processed + 1);
+            let response = this.blockStates.get(this.lastProcessed + 1);
             if (!response)
                 break;
             this.blockStates.delete(response.block_num);
-            this.last_processed = response.block_num;
-            if (this.last_processed == this.skip_from)
-                this.last_processed = this.skip_to;
+            this.lastProcessed = response.block_num;
+            if (this.lastProcessed == this.skipFrom)
+                this.lastProcessed = this.skipTo;
             let block, traces = [], deltas = [];
             if (response.block.length)
                 block = this.deserialize('signed_block', response.block);
@@ -137,7 +161,7 @@ class Connection {
     }
 
     get_status_result_v0(response) {
-        this.end_block_num = response.state_end_block_num;
+        this.end_block_num = response.head_block_num + 1;
         this.requestBlocks();
     }
 
@@ -178,7 +202,7 @@ class MonitorTransfers {
                 if (!(response.block_num % 100))
                     console.log(`block ${numberWithCommas(response.block_num)}`)
                 // if (block)
-                //     console.log(toJsonNoBin(block));
+                //     console.log(this.connection.toJsonUnpackTransaction(block));
                 // if (traces.length)
                 //     console.log(toJsonNoBin(traces));
                 for (let [_, delta] of deltas)
@@ -310,5 +334,5 @@ class FillPostgress {
     }
 } // FillPostgress
 
-// let foo = new MonitorTransfers;
-let foo = new FillPostgress;
+let foo = new MonitorTransfers;
+// let foo = new FillPostgress;
