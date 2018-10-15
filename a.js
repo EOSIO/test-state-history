@@ -96,6 +96,8 @@ class Connection {
                     packed_trx = this.deserialize('transaction', zlib.unzipSync(packed_trx));
                 return { ...pt, packed_trx };
             }
+            if (k === 'packed_trx' && v instanceof Uint8Array)
+                return this.deserialize('transaction', v);
             if (v instanceof Uint8Array)
                 return "...";
             return v;
@@ -244,11 +246,20 @@ class MonitorTransfers {
     }
 
     contract_row(blockNum, delta) {
+        // this.connection.forEachRow(delta, (present, data) => {
+        //     if (data.code !== 'eosio.token' && data.table !== 'accounts' || data.scope !== 'eosio')
+        //         return;
+        //     let content = this.deserializeTable(data.code, data.table, data.value);
+        //     console.log(`block: ${blockNum} present: ${present} code:${data.code} scope:${data.scope} table:${data.table} table_payer:${data.payer} payer:${data.payer} primary_key:${data.primary_key}  ${JSON.stringify(content)}`);
+        // });
+    }
+
+    generated_transaction(blockNum, delta) {
         this.connection.forEachRow(delta, (present, data) => {
-            if (data.code !== 'eosio.token' && data.table !== 'accounts' || data.scope !== 'eosio')
+            if (data.sender === '.............')
                 return;
-            let content = this.deserializeTable(data.code, data.table, data.value);
-            console.log(`block: ${blockNum} present: ${present} code:${data.code} scope:${data.scope} table:${data.table} table_payer:${data.payer} payer:${data.payer} primary_key:${data.primary_key}  ${JSON.stringify(content)}`);
+            console.log('generated_transaction')
+            console.log(this.connection.toJsonUnpackTransaction({ present, ...data }));
         });
     }
 } // MonitorTransfers
