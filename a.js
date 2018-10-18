@@ -5,8 +5,7 @@ const { TextDecoder, TextEncoder } = require('text-encoding');
 const abiAbi = require('./node_modules/eosjs2/src/abi.abi.json');
 const pg = require('pg');
 const zlib = require('zlib');
-
-const schema = 'chain';
+const commander = require('commander');
 
 const abiTypes = Serialize.getTypesFromAbi(Serialize.createInitialTypes(), abiAbi);
 
@@ -47,8 +46,7 @@ function toJsonNoBin(x) {
 }
 
 class Connection {
-    constructor({ requestArgs, receivedAbi, receivedBlock }) {
-        this.requestArgs = requestArgs;
+    constructor({ receivedAbi, receivedBlock }) {
         this.receivedAbi = receivedAbi;
         this.receivedBlock = receivedBlock;
 
@@ -126,7 +124,7 @@ class Connection {
         this.send(['get_status_request_v0', {}]);
     }
 
-    requestBlocks() {
+    requestBlocks(requestArgs) {
         this.send(['get_blocks_request_v0', {
             start_block_num: 0,
             end_block_num: 0xffffffff,
@@ -137,13 +135,12 @@ class Connection {
             fetch_block_state: false,
             fetch_traces: false,
             fetch_deltas: false,
-            ...this.requestArgs
+            ...requestArgs
         }]);
     }
 
     get_status_result_v0(response) {
-        // console.log(response);
-        this.requestBlocks();
+        console.log(response);
     }
 
     get_blocks_result_v0(response) {
@@ -191,19 +188,18 @@ class Connection {
     }
 } // Connection
 
-class MonitorTransfers {
+class Monitor {
     constructor() {
         this.accounts = new Map;
         this.tableIds = new Map;
 
         this.connection = new Connection({
-            requestArgs: {
+            receivedAbi: () => this.connection.requestBlocks({
                 fetch_block: false,
                 fetch_block_state: false,
                 fetch_traces: false,
-                fetch_deltas: false,
-            },
-            receivedAbi: () => this.connection.requestStatus(),
+                fetch_deltas: true,
+            }),
             receivedBlock: async (response, block, traces, deltas) => {
                 if (!response.this_block)
                     return;
@@ -271,59 +267,95 @@ class MonitorTransfers {
             console.log(this.connection.toJsonUnpackTransaction({ present, ...data }));
         });
     }
-} // MonitorTransfers
+} // Monitor
 
 class FillPostgress {
-    constructor() {
+    constructor({ schema = 'chain', deleteSchema = false, createSchema = false }) {
+        this.schema = schema;
         this.pool = new pg.Pool;
         this.sqlTables = new Map;
         this.numRows = 0;
 
         this.connection = new Connection({
-            requestArgs: {
-                fetch_block: false,
-                fetch_block_state: false,
-                fetch_traces: false,
-                fetch_deltas: true,
+            receivedAbi: async () => {
+                this.processAbi();
+                await this.initDatabase(deleteSchema, createSchema);
+                await this.start();
             },
-            receivedAbi: () => this.createDatabase(),
             receivedBlock: this.receivedBlock.bind(this),
         });
     }
 
-    async createDatabase() {
-        try {
-            try {
-                await this.pool.query(`drop schema ${schema} cascade`);
-            } catch (e) {
-            }
-            await this.pool.query(`create schema ${schema}`);
+    processAbi() {
+        for (let abiTable of this.connection.abi.tables) {
+            const abiType = Serialize.getType(this.connection.types, abiTable.type).fields[0].type;
+            const sqlTable = { name: abiTable.name, abiType, fields: [], insert: '' };
+            this.sqlTables.set(sqlTable.name, sqlTable);
 
-            for (let abiTable of this.connection.abi.tables) {
-                const type = Serialize.getType(this.connection.types, abiTable.type).fields[0].type;
-                const sqlTable = { name: abiTable.name, fields: [], insert: '' };
-                this.sqlTables.set(sqlTable.name, sqlTable);
-                for (let field of type.fields) {
-                    if (!field.type.arrayOf && !field.type.optionalOf && !field.type.fields.length) {
-                        let sqlType = sqlTypes[field.type.name];
-                        if (!sqlType)
-                            throw new Error('unknown type for sql conversion: ' + field.type.name);
-                        sqlTable.fields.push({ name: field.name, type: sqlType });
-                    }
+            for (let field of abiType.fields) {
+                if (!field.type.arrayOf && !field.type.optionalOf && !field.type.fields.length) {
+                    let sqlType = sqlTypes[field.type.name];
+                    if (!sqlType)
+                        throw new Error('unknown type for sql conversion: ' + field.type.name);
+                    sqlTable.fields.push({ name: field.name, type: sqlType });
                 }
-                sqlTable.fields.splice(0, 0,
-                    { name: 'block_index', type: { name: 'bigint', convert: x => x } },
-                    { name: 'present', type: { name: 'boolean', convert: x => x } });
-                let fieldNames = sqlTable.fields.map(({ name }) => `"${name}"`).join(', ');
-                let values = [...Array(sqlTable.fields.length).keys()].map(n => `$${n + 1}`).join(',');
-                sqlTable.insert = `insert into ${schema}.${sqlTable.name}(${fieldNames}) values (${values})`;
-                let pk = '"block_index"' + abiTable.key_names.map(x => ',"' + x + '"').join('');
-                let query = `create table ${schema}.${sqlTable.name} (${sqlTable.fields.map(({ name, type }) => `"${name}" ${type.name}`).join(', ')}, primary key(${pk}));`;
-
-                await this.pool.query(query);
             }
+            sqlTable.fields.splice(0, 0,
+                { name: 'block_index', type: { name: 'bigint', convert: x => x } },
+                { name: 'present', type: { name: 'boolean', convert: x => x } });
+            let fieldNames = sqlTable.fields.map(({ name }) => `"${name}"`).join(', ');
+            let values = [...Array(sqlTable.fields.length).keys()].map(n => `$${n + 1}`).join(',');
+            sqlTable.insert = `insert into ${this.schema}.${sqlTable.name}(${fieldNames}) values (${values})`;
+        }
+    }
 
-            this.connection.requestStatus();
+    async initDatabase(deleteSchema = false, createSchema = false) {
+        try {
+            if (deleteSchema) {
+                try {
+                    await this.pool.query(`drop schema ${this.schema} cascade`);
+                } catch (e) {
+                }
+            }
+            if (createSchema) {
+                await this.pool.query('start transaction;');
+                await this.pool.query(`create schema ${this.schema}`);
+                await this.pool.query(`create table ${this.schema}.received_blocks ("block_index" bigint, "block_id" varchar(64), primary key("block_index"));`);
+                await this.pool.query(`create table ${this.schema}.status ("head" bigint, "irreversible" bigint);`);
+                await this.pool.query(`create unique index on ${this.schema}.status ((true));`);
+                await this.pool.query(`insert into ${this.schema}.status values (0, 0);`);
+                for (let abiTable of this.connection.abi.tables) {
+                    let sqlTable = this.sqlTables.get(abiTable.name);
+                    let pk = '"block_index"' + abiTable.key_names.map(x => ',"' + x + '"').join('');
+                    let query = `create table ${this.schema}.${sqlTable.name} (${sqlTable.fields.map(({ name, type }) => `"${name}" ${type.name}`).join(', ')}, primary key(${pk}));`;
+                    await this.pool.query(query);
+                }
+                await this.pool.query('commit;');
+            }
+        } catch (e) {
+            console.log(e);
+            process.exit(1);
+        }
+    }
+
+    async start() {
+        try {
+            let status = (await this.pool.query(`select * from ${this.schema}.status`)).rows[0];
+            this.head = +status.head;
+            this.irreversible = +status.irreversible;
+
+            let have_positions = (await this.pool.query(
+                `select * from ${this.schema}.received_blocks where block_index >= ${this.irreversible + 1} and block_index <= ${this.head}`))
+                .rows.map(({ block_index, block_id }) => ({ block_num: block_index, block_id }));
+
+            this.connection.requestBlocks({
+                start_block_num: this.head + 1,
+                have_positions,
+                fetch_block: false,
+                fetch_block_state: false,
+                fetch_traces: false,
+                fetch_deltas: true,
+            });
         } catch (e) {
             console.log(e);
             process.exit(1);
@@ -333,20 +365,38 @@ class FillPostgress {
     async receivedBlock(response, block, traces, deltas) {
         if (!response.this_block)
             return;
-        if (!(response.this_block.block_num % 100)) {
+        let block_num = response.this_block.block_num;
+        if (!(block_num % 100) || block_num >= this.irreversible) {
             if (this.numRows)
                 console.log(`    created ${numberWithCommas(this.numRows)} rows`);
             this.numRows = 0;
-            console.log(`block ${numberWithCommas(response.this_block.block_num)}`)
+            console.log(`block ${numberWithCommas(block_num)}`)
         }
         try {
+            if (this.head && block_num > this.head + 1)
+                throw new Error(`Skipped block(s): head = ${this.head}, received = ${block_num}`);
+            let switchForks = this.head && block_num < this.head + 1;
+            if (switchForks)
+                console.log(`Switch forks: old head = ${this.head}, new head = ${block_num}`);
+
             await this.pool.query('start transaction;');
+            this.head = block_num;
+            this.irreversible = response.last_irreversible.block_num;
+            await this.pool.query(`update ${this.schema}.status set head=$1, irreversible=$2;`, [this.head, this.irreversible]);
+
+            if (switchForks) {
+                await this.pool.query(`delete from ${this.schema}.received_blocks where block_index >= $1;`, [block_num]);
+                for (let x of this.sqlTables)
+                    await this.pool.query(`delete from ${this.schema}."${x[1].name}" where block_index >= $1;`, [block_num]);
+            }
+            await this.pool.query(`insert into ${this.schema}.received_blocks values ($1, $2);`, [block_num, response.this_block.block_id]);
+
             for (let [_, delta] of deltas) {
                 let sqlTable = this.sqlTables.get(delta.name);
                 let queries = [];
                 this.connection.forEachRow(delta, (present, data) => {
                     let values = sqlTable.fields.map(({ name, type }) => type.convert(data[name]));
-                    values[0] = response.this_block.block_num;
+                    values[0] = block_num;
                     values[1] = present;
                     queries.push([sqlTable.insert, values]);
                 });
@@ -357,6 +407,7 @@ class FillPostgress {
                     } catch (e) {
                         console.log(query, value);
                         console.log(e);
+                        process.exit(1);
                     }
                 }
             }
@@ -368,5 +419,11 @@ class FillPostgress {
     }
 } // FillPostgress
 
-// let foo = new MonitorTransfers;
-let foo = new FillPostgress;
+commander
+    .option('-d, --delete-schema', 'Delete schema')
+    .option('-c, --create-schema', 'Create schema and tables')
+    .option('-s, --schema [name]', 'Schema name', 'chain')
+    .parse(process.argv);
+
+// const monitor = new Monitor;
+const fill = new FillPostgress(commander);
