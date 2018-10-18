@@ -47,21 +47,16 @@ function toJsonNoBin(x) {
 }
 
 class Connection {
-    constructor({ receivedAbi, receivedBlock }) {
-        this.end_block_num = 0;
-        this.lastRequested = 1;
-        this.lastProcessed = 1;
-        this.skipFrom = -1;
-        this.skipTo = 18000000;
-        this.simultaneous = 10;
-        this.inProcessBlockStates = false;
+    constructor({ requestArgs, receivedAbi, receivedBlock }) {
+        this.requestArgs = requestArgs;
         this.receivedAbi = receivedAbi;
         this.receivedBlock = receivedBlock;
 
         this.abi = null;
         this.types = null;
         this.tables = new Map;
-        this.blockStates = new Map;
+        this.blocksQueue = [];
+        this.inProcessBlocks = false;
 
         this.ws = new WebSocket('ws://localhost:8080/', { perMessageDeflate: false });
         this.ws.on('message', data => this.onMessage(data));
@@ -108,17 +103,22 @@ class Connection {
         this.ws.send(this.serialize('request', request));
     }
 
-    async onMessage(data) {
-        if (!this.abi) {
-            this.abi = JSON.parse(data);
-            this.types = Serialize.getTypesFromAbi(Serialize.createInitialTypes(), this.abi);
-            for (const table of this.abi.tables)
-                this.tables.set(table.name, table.type);
-            if (this.receivedAbi)
-                this.receivedAbi();
-        } else {
-            const [type, response] = this.deserialize('result', data);
-            this[type](response);
+    onMessage(data) {
+        try {
+            if (!this.abi) {
+                this.abi = JSON.parse(data);
+                this.types = Serialize.getTypesFromAbi(Serialize.createInitialTypes(), this.abi);
+                for (const table of this.abi.tables)
+                    this.tables.set(table.name, table.type);
+                if (this.receivedAbi)
+                    this.receivedAbi();
+            } else {
+                const [type, response] = this.deserialize('result', data);
+                this[type](response);
+            }
+        } catch (e) {
+            console.log(e);
+            process.exit(1);
         }
     }
 
@@ -127,49 +127,47 @@ class Connection {
     }
 
     requestBlocks() {
-        for (let block_num = this.lastRequested + 1; block_num <= this.lastProcessed + this.simultaneous && block_num < this.end_block_num; ++block_num) {
-            this.send(['get_block_request_v0', { block_num }]);
-            this.lastRequested = block_num;
-            if (this.lastRequested == this.skipFrom) {
-                this.lastRequested = this.skipTo;
-                break;
-            }
-        }
-    }
-
-    async processBlockStates() {
-        if (this.inProcessBlockStates)
-            return;
-        this.inProcessBlockStates = true;
-        while (true) {
-            let response = this.blockStates.get(this.lastProcessed + 1);
-            if (!response)
-                break;
-            this.blockStates.delete(response.block_num);
-            this.lastProcessed = response.block_num;
-            if (this.lastProcessed == this.skipFrom)
-                this.lastProcessed = this.skipTo;
-            let block, traces = [], deltas = [];
-            if (response.block.length)
-                block = this.deserialize('signed_block', response.block);
-            if (response.traces.length)
-                traces = this.deserialize('transaction_trace[]', response.traces);
-            if (response.deltas.length)
-                deltas = this.deserialize('table_delta[]', response.deltas);
-            await this.receivedBlock(response, block, traces, deltas);
-        }
-        this.inProcessBlockStates = false;
-        this.requestBlocks();
+        this.send(['get_blocks_request_v0', {
+            start_block_num: 0,
+            end_block_num: 0xffffffff,
+            max_messages_in_flight: 5,
+            have_positions: [],
+            irreversible_only: false,
+            fetch_block: false,
+            fetch_block_state: false,
+            fetch_traces: false,
+            fetch_deltas: false,
+            ...this.requestArgs
+        }]);
     }
 
     get_status_result_v0(response) {
-        this.end_block_num = response.head_block_num + 1;
+        // console.log(response);
         this.requestBlocks();
     }
 
-    get_block_result_v0(response) {
-        this.blockStates.set(response.block_num, response);
-        this.processBlockStates();
+    get_blocks_result_v0(response) {
+        this.blocksQueue.push(response);
+        this.processBlocks();
+    }
+
+    async processBlocks() {
+        if (this.inProcessBlocks)
+            return;
+        this.inProcessBlocks = true;
+        while (this.blocksQueue.length) {
+            let response = this.blocksQueue.shift();
+            this.send(['get_blocks_ack_request_v0', { num_messages: 1 }]);
+            let block, traces = [], deltas = [];
+            if (response.block && response.block.length)
+                block = this.deserialize('signed_block', response.block);
+            if (response.traces && response.traces.length)
+                traces = this.deserialize('transaction_trace[]', response.traces);
+            if (response.deltas && response.deltas.length)
+                deltas = this.deserialize('table_delta[]', response.deltas);
+            await this.receivedBlock(response, block, traces, deltas);
+        }
+        this.inProcessBlocks = false;
     }
 
     forEachRow(delta, f) {
@@ -186,9 +184,9 @@ class Connection {
         }
     }
 
-    dumpDelta(delta) {
+    dumpDelta(delta, extra) {
         this.forEachRow(delta, (present, data) => {
-            console.log('   ', present, JSON.stringify(data));
+            console.log(this.toJsonUnpackTransaction({ ...extra, present, data }));
         });
     }
 } // Connection
@@ -199,17 +197,28 @@ class MonitorTransfers {
         this.tableIds = new Map;
 
         this.connection = new Connection({
+            requestArgs: {
+                fetch_block: false,
+                fetch_block_state: false,
+                fetch_traces: false,
+                fetch_deltas: false,
+            },
             receivedAbi: () => this.connection.requestStatus(),
             receivedBlock: async (response, block, traces, deltas) => {
-                if (!(response.block_num % 100))
-                    console.log(`block ${numberWithCommas(response.block_num)}`)
-                // if (block)
-                //     console.log(this.connection.toJsonUnpackTransaction(block));
-                // if (traces.length)
-                //     console.log(toJsonNoBin(traces));
+                if (!response.this_block)
+                    return;
+                if (!(response.this_block.block_num % 100))
+                    console.log(`block ${numberWithCommas(response.this_block.block_num)}`)
+                if (block)
+                    console.log(this.connection.toJsonUnpackTransaction(block));
+                if (traces.length)
+                    console.log(toJsonNoBin(traces));
+                for (let [_, delta] of deltas)
+                    //if (delta.name === 'resource_limits_config')
+                    this.connection.dumpDelta(delta, { name: delta.name, block_num: response.this_block.block_num });
                 for (let [_, delta] of deltas)
                     if (this[delta.name])
-                        this[delta.name](response.block_num, delta);
+                        this[delta.name](response.this_block.block_num, delta);
             }
         });
     }
@@ -271,6 +280,12 @@ class FillPostgress {
         this.numRows = 0;
 
         this.connection = new Connection({
+            requestArgs: {
+                fetch_block: false,
+                fetch_block_state: false,
+                fetch_traces: false,
+                fetch_deltas: true,
+            },
             receivedAbi: () => this.createDatabase(),
             receivedBlock: this.receivedBlock.bind(this),
         });
@@ -311,39 +326,47 @@ class FillPostgress {
             this.connection.requestStatus();
         } catch (e) {
             console.log(e);
+            process.exit(1);
         }
     }
 
     async receivedBlock(response, block, traces, deltas) {
-        if (!(response.block_num % 100)) {
+        if (!response.this_block)
+            return;
+        if (!(response.this_block.block_num % 100)) {
             if (this.numRows)
                 console.log(`    created ${numberWithCommas(this.numRows)} rows`);
             this.numRows = 0;
-            console.log(`block ${numberWithCommas(response.block_num)}`)
+            console.log(`block ${numberWithCommas(response.this_block.block_num)}`)
         }
-        await this.pool.query('start transaction;');
-        for (let [_, delta] of deltas) {
-            let sqlTable = this.sqlTables.get(delta.name);
-            let queries = [];
-            this.connection.forEachRow(delta, (present, data) => {
-                let values = sqlTable.fields.map(({ name, type }) => type.convert(data[name]));
-                values[0] = response.block_num;
-                values[1] = present;
-                queries.push([sqlTable.insert, values]);
-            });
-            for (let [query, value] of queries) {
-                try {
-                    await this.pool.query(query, value);
-                    this.numRows += queries.length;
-                } catch (e) {
-                    console.log(query, value);
-                    console.log(e);
+        try {
+            await this.pool.query('start transaction;');
+            for (let [_, delta] of deltas) {
+                let sqlTable = this.sqlTables.get(delta.name);
+                let queries = [];
+                this.connection.forEachRow(delta, (present, data) => {
+                    let values = sqlTable.fields.map(({ name, type }) => type.convert(data[name]));
+                    values[0] = response.this_block.block_num;
+                    values[1] = present;
+                    queries.push([sqlTable.insert, values]);
+                });
+                for (let [query, value] of queries) {
+                    try {
+                        await this.pool.query(query, value);
+                        this.numRows += queries.length;
+                    } catch (e) {
+                        console.log(query, value);
+                        console.log(e);
+                    }
                 }
             }
+            await this.pool.query('commit;');
+        } catch (e) {
+            console.log(e);
+            process.exit(1);
         }
-        await this.pool.query('commit;');
     }
 } // FillPostgress
 
-let foo = new MonitorTransfers;
-// let foo = new FillPostgress;
+// let foo = new MonitorTransfers;
+let foo = new FillPostgress;
