@@ -9,6 +9,7 @@
     "eosjs2": "/Users/toddfleming/eosjs2",
     "node-fetch": "^2.2.0",
     "pg": "^7.4.3",
+    "pg-copy-streams": "^1.2.0",
     "text-encoding": "^0.6.4",
     "ws": "^6.0.0"
   }

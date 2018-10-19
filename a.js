@@ -4,33 +4,34 @@ const fetch = require('node-fetch');
 const { TextDecoder, TextEncoder } = require('text-encoding');
 const abiAbi = require('./node_modules/eosjs2/src/abi.abi.json');
 const pg = require('pg');
+const copyFrom = require('pg-copy-streams').from;
 const zlib = require('zlib');
 const commander = require('commander');
 
 const abiTypes = Serialize.getTypesFromAbi(Serialize.createInitialTypes(), abiAbi);
 
 const sqlTypes = {
-    bool: { name: 'bool', convert: x => x },
-    varuint: { name: 'bigint', convert: x => x },
-    varint: { name: 'integer', convert: x => x },
-    uint8: { name: 'smallint', convert: x => x },
-    uint16: { name: 'integer', convert: x => x },
-    uint32: { name: 'bigint', convert: x => x },
-    uint64: { name: 'decimal', convert: x => x },
-    uint128: { name: 'decimal', convert: x => x },
-    int8: { name: 'smallint', convert: x => x },
-    int16: { name: 'smallint', convert: x => x },
-    int32: { name: 'integer', convert: x => x },
-    int64: { name: 'bigint', convert: x => x },
-    int128: { name: 'decimal', convert: x => x },
-    float64: { name: 'float8', convert: x => x },
-    float128: { name: 'bytea', convert: x => x },
-    name: { name: 'varchar(13)', convert: x => x },
-    time_point: { name: 'varchar', convert: x => x },
-    time_point_sec: { name: 'varchar', convert: x => x },
-    block_timestamp_type: { name: 'varchar', convert: x => x },
-    checksum256: { name: 'varchar(64)', convert: x => x },
-    bytes: { name: 'bytea', convert: x => '\\x' + Serialize.arrayToHex(x) },
+    bool: { name: 'bool', convert: x => x, convertBulk: x => x ? 't' : 'f' },
+    varuint: { name: 'bigint', convert: x => x, convertBulk: x => '' + x },
+    varint: { name: 'integer', convert: x => x, convertBulk: x => '' + x },
+    uint8: { name: 'smallint', convert: x => x, convertBulk: x => '' + x },
+    uint16: { name: 'integer', convert: x => x, convertBulk: x => '' + x },
+    uint32: { name: 'bigint', convert: x => x, convertBulk: x => '' + x },
+    uint64: { name: 'decimal', convert: x => x, convertBulk: x => '' + x },
+    uint128: { name: 'decimal', convert: x => x, convertBulk: x => '' + x },
+    int8: { name: 'smallint', convert: x => x, convertBulk: x => '' + x },
+    int16: { name: 'smallint', convert: x => x, convertBulk: x => '' + x },
+    int32: { name: 'integer', convert: x => x, convertBulk: x => '' + x },
+    int64: { name: 'bigint', convert: x => x, convertBulk: x => '' + x },
+    int128: { name: 'decimal', convert: x => x, convertBulk: x => '' + x },
+    float64: { name: 'float8', convert: x => x, convertBulk: x => '' + x },
+    float128: { name: 'bytea', convert: x => x, convertBulk: x => '\\x' + x },
+    name: { name: 'varchar(13)', convert: x => x, convertBulk: x => '' + x },
+    time_point: { name: 'varchar', convert: x => x, convertBulk: x => '' + x },
+    time_point_sec: { name: 'varchar', convert: x => x, convertBulk: x => '' + x },
+    block_timestamp_type: { name: 'varchar', convert: x => x, convertBulk: x => '' + x },
+    checksum256: { name: 'varchar(64)', convert: x => x, convertBulk: x => '' + x },
+    bytes: { name: 'bytea', convert: x => '\\x' + Serialize.arrayToHex(x), convertBulk: x => '\\x' }, // !!!!!!!!!!!!!!! + Serialize.arrayToHex(x) },
 };
 
 function numberWithCommas(x) {
@@ -269,20 +270,26 @@ class Monitor {
 } // Monitor
 
 class FillPostgress {
-    constructor({ socketAddress, schema = 'chain', deleteSchema = false, createSchema = false }) {
+    constructor({ socketAddress, schema = 'chain', deleteSchema = false, createSchema = false, irreversibleOnly = false, bulkFill = false }) {
+        if (bulkFill)
+            irreversibleOnly = true;
+
         this.schema = schema;
-        this.pool = new pg.Pool;
+        this.pool = new pg.Pool({ max: 30 });
         this.sqlTables = new Map;
         this.numRows = 0;
+        this.bulkFill = bulkFill;
 
         this.connection = new Connection({
             socketAddress,
             receivedAbi: async () => {
                 this.processAbi();
                 await this.initDatabase(deleteSchema, createSchema);
-                await this.start();
+                if (bulkFill)
+                    await this.startFastFill();
+                await this.start(irreversibleOnly);
             },
-            receivedBlock: this.receivedBlock.bind(this),
+            receivedBlock: bulkFill ? this.receivedBlockBulk.bind(this) : this.receivedBlock.bind(this),
         });
     }
 
@@ -328,7 +335,7 @@ class FillPostgress {
                 for (let abiTable of this.connection.abi.tables) {
                     let sqlTable = this.sqlTables.get(abiTable.name);
                     let pk = '"block_index"' + abiTable.key_names.map(x => ',"' + x + '"').join('');
-                    let query = `create table ${this.schema}.${sqlTable.name} (${sqlTable.fields.map(({ name, type }) => `"${name}" ${type.name}`).join(', ')}, primary key(${pk}));`;
+                    let query = `create table ${this.schema}.${sqlTable.name} (${sqlTable.fields.map(({ name, type }) => `"${name}" ${type.name}`).join(', ')});`;
                     await client.query(query);
                 }
                 await client.query('commit;');
@@ -340,7 +347,21 @@ class FillPostgress {
         }
     }
 
-    async start() {
+    async startFastFill() {
+        for (let [_, sqlTable] of this.sqlTables) {
+            console.log('aa')
+            console.log(sqlTable.name);
+            let fields = sqlTable.fields.map(({ name }) => `"${name}"`).join(', ');
+            // fields = 'block_index,present'; // !!!!
+            console.log('a')
+            sqlTable.connection = await this.pool.connect();
+            console.log('b')
+            sqlTable.stream = await sqlTable.connection.query(copyFrom(`copy ${this.schema}.${sqlTable.name}(${fields}) from stdin`));
+            console.log('c')
+        }
+    }
+
+    async start(irreversible_only) {
         try {
             let status = (await this.pool.query(`select * from ${this.schema}.status`)).rows[0];
             this.head = +status.head;
@@ -351,6 +372,7 @@ class FillPostgress {
                 .rows.map(({ block_index, block_id }) => ({ block_num: block_index, block_id }));
 
             this.connection.requestBlocks({
+                irreversible_only,
                 start_block_num: this.head + 1,
                 have_positions,
                 fetch_block: false,
@@ -373,8 +395,8 @@ class FillPostgress {
             this.numRows = 0;
             console.log(`block ${numberWithCommas(block_num)}`)
         }
-        // if (block_num >= 500)
-        //     process.exit(1);
+        if (block_num >= 1000)
+            process.exit(1);
         try {
             if (this.head && block_num > this.head + 1)
                 throw new Error(`Skipped block(s): head = ${this.head}, received = ${block_num}`);
@@ -396,7 +418,6 @@ class FillPostgress {
             }
             await this.insertClient.query(`insert into ${this.schema}.received_blocks values ($1, $2);`, [block_num, response.this_block.block_id]);
 
-            let promises = [];
             for (let [_, delta] of deltas) {
                 let sqlTable = this.sqlTables.get(delta.name);
                 let queries = [];
@@ -426,12 +447,79 @@ class FillPostgress {
             console.log(e);
             process.exit(1);
         }
-    }
+    } // receivedBlock
+
+    async receivedBlockBulk(response, block, traces, deltas) {
+        if (!response.this_block)
+            return;
+        let block_num = response.this_block.block_num;
+        if (!(block_num % 100) || block_num >= this.irreversible) {
+            // if (this.numRows)
+            //     console.log(`    created ${numberWithCommas(this.numRows)} rows`);
+            // this.numRows = 0;
+            console.log(`block ${numberWithCommas(block_num)}`)
+        }
+
+        if (block_num >= 1000) {
+            console.log(`created ${numberWithCommas(this.numRows)} rows`);
+            for (let [_, sqlTable] of this.sqlTables) {
+                await new Promise(resolve => sqlTable.stream.end(resolve));
+            }
+            process.exit(0);
+        }
+
+
+
+        try {
+            if (this.head && block_num > this.head + 1)
+                throw new Error(`Skipped block(s): head = ${this.head}, received = ${block_num}`);
+            let switchForks = this.head && block_num < this.head + 1;
+            if (switchForks)
+                throw new Error('Tried to switch forks during fast fill');
+
+            this.head = block_num;
+            this.irreversible = response.last_irreversible.block_num;
+
+            // !!! await this.insertClient.query(`insert into ${this.schema}.received_blocks values ($1, $2);`, [block_num, response.this_block.block_id]);
+
+            for (let [_, delta] of deltas) {
+                let sqlTable = this.sqlTables.get(delta.name);
+                this.connection.forEachRow(delta, (present, data) => {
+
+                    // if (delta.name !== 'account')
+                    //     return; // !!!!
+
+                    ++this.numRows;
+                    let s = '';
+                    function f(x) {
+                        s += x;
+                        sqlTable.stream.write(x);
+                    }
+                    f(`${block_num}\t${present ? 't' : 'f'}`);
+                    for (let i = 2; i < sqlTable.fields.length; ++i) {
+                        let { name, type } = sqlTable.fields[i];
+                        f('\t' + type.convertBulk(data[name]));
+                    }
+                    f('\n');
+
+                    //console.log(JSON.stringify(s))
+
+
+
+                });
+            }
+        } catch (e) {
+            console.log(e);
+            process.exit(1);
+        }
+    } // receivedBlockBulk
 } // FillPostgress
 
 commander
     .option('-d, --delete-schema', 'Delete schema')
     .option('-c, --create-schema', 'Create schema and tables')
+    .option('-i, --irreversible-only', 'Only follow irreversible')
+    .option('-f, --bulk-fill', 'Use bulk-filling method; exits when done')
     .option('-s, --schema [name]', 'Schema name', 'chain')
     .option('-a, --socket-address [addr]', 'Socket address', 'ws://localhost:8080/')
     .parse(process.argv);
