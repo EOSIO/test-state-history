@@ -269,7 +269,7 @@ class Monitor {
 } // Monitor
 
 class FillPostgress {
-    constructor({ socketAddress, schema = 'chain', deleteSchema = false, createSchema = false }) {
+    constructor({ socketAddress, schema = 'chain', deleteSchema = false, createSchema = false, irreversibleOnly = false }) {
         this.schema = schema;
         this.pool = new pg.Pool;
         this.sqlTables = new Map;
@@ -280,7 +280,7 @@ class FillPostgress {
             receivedAbi: async () => {
                 this.processAbi();
                 await this.initDatabase(deleteSchema, createSchema);
-                await this.start();
+                await this.start(irreversibleOnly);
             },
             receivedBlock: this.receivedBlock.bind(this),
         });
@@ -328,6 +328,7 @@ class FillPostgress {
                 for (let abiTable of this.connection.abi.tables) {
                     let sqlTable = this.sqlTables.get(abiTable.name);
                     let pk = '"block_index"' + abiTable.key_names.map(x => ',"' + x + '"').join('');
+                    // !!! pk: add later?
                     let query = `create table ${this.schema}.${sqlTable.name} (${sqlTable.fields.map(({ name, type }) => `"${name}" ${type.name}`).join(', ')}, primary key(${pk}));`;
                     await client.query(query);
                 }
@@ -340,7 +341,7 @@ class FillPostgress {
         }
     }
 
-    async start() {
+    async start(irreversible_only) {
         try {
             let status = (await this.pool.query(`select * from ${this.schema}.status`)).rows[0];
             this.head = +status.head;
@@ -351,6 +352,7 @@ class FillPostgress {
                 .rows.map(({ block_index, block_id }) => ({ block_num: block_index, block_id }));
 
             this.connection.requestBlocks({
+                irreversible_only,
                 start_block_num: this.head + 1,
                 have_positions,
                 fetch_block: false,
@@ -396,7 +398,6 @@ class FillPostgress {
             }
             await this.insertClient.query(`insert into ${this.schema}.received_blocks values ($1, $2);`, [block_num, response.this_block.block_id]);
 
-            let promises = [];
             for (let [_, delta] of deltas) {
                 let sqlTable = this.sqlTables.get(delta.name);
                 let queries = [];
@@ -426,12 +427,13 @@ class FillPostgress {
             console.log(e);
             process.exit(1);
         }
-    }
+    } // receivedBlock
 } // FillPostgress
 
 commander
     .option('-d, --delete-schema', 'Delete schema')
     .option('-c, --create-schema', 'Create schema and tables')
+    .option('-i, --irreversible-only', 'Only follow irreversible')
     .option('-s, --schema [name]', 'Schema name', 'chain')
     .option('-a, --socket-address [addr]', 'Socket address', 'ws://localhost:8080/')
     .parse(process.argv);
