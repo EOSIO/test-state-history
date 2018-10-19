@@ -46,7 +46,7 @@ function toJsonNoBin(x) {
 }
 
 class Connection {
-    constructor({ receivedAbi, receivedBlock }) {
+    constructor({ socketAddress, receivedAbi, receivedBlock }) {
         this.receivedAbi = receivedAbi;
         this.receivedBlock = receivedBlock;
 
@@ -56,7 +56,7 @@ class Connection {
         this.blocksQueue = [];
         this.inProcessBlocks = false;
 
-        this.ws = new WebSocket('ws://localhost:8080/', { perMessageDeflate: false });
+        this.ws = new WebSocket(socketAddress, { perMessageDeflate: false });
         this.ws.on('message', data => this.onMessage(data));
     }
 
@@ -188,11 +188,12 @@ class Connection {
 } // Connection
 
 class Monitor {
-    constructor() {
+    constructor({ socketAddress }) {
         this.accounts = new Map;
         this.tableIds = new Map;
 
         this.connection = new Connection({
+            socketAddress,
             receivedAbi: () => this.connection.requestBlocks({
                 fetch_block: false,
                 fetch_traces: false,
@@ -268,13 +269,14 @@ class Monitor {
 } // Monitor
 
 class FillPostgress {
-    constructor({ schema = 'chain', deleteSchema = false, createSchema = false }) {
+    constructor({ socketAddress, schema = 'chain', deleteSchema = false, createSchema = false }) {
         this.schema = schema;
         this.pool = new pg.Pool;
         this.sqlTables = new Map;
         this.numRows = 0;
 
         this.connection = new Connection({
+            socketAddress,
             receivedAbi: async () => {
                 this.processAbi();
                 await this.initDatabase(deleteSchema, createSchema);
@@ -420,7 +422,8 @@ commander
     .option('-d, --delete-schema', 'Delete schema')
     .option('-c, --create-schema', 'Create schema and tables')
     .option('-s, --schema [name]', 'Schema name', 'chain')
+    .option('-a, --socket-address [addr]', 'Socket address', 'ws://localhost:8080/')
     .parse(process.argv);
 
-// const monitor = new Monitor;
+// const monitor = new Monitor(commander);
 const fill = new FillPostgress(commander);
