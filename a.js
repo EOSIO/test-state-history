@@ -132,7 +132,6 @@ class Connection {
             have_positions: [],
             irreversible_only: false,
             fetch_block: false,
-            fetch_block_state: false,
             fetch_traces: false,
             fetch_deltas: false,
             ...requestArgs
@@ -159,9 +158,9 @@ class Connection {
             if (response.block && response.block.length)
                 block = this.deserialize('signed_block', response.block);
             if (response.traces && response.traces.length)
-                traces = this.deserialize('transaction_trace[]', response.traces);
+                traces = this.deserialize('transaction_trace[]', zlib.unzipSync(response.traces));
             if (response.deltas && response.deltas.length)
-                deltas = this.deserialize('table_delta[]', response.deltas);
+                deltas = this.deserialize('table_delta[]', zlib.unzipSync(response.deltas));
             await this.receivedBlock(response, block, traces, deltas);
         }
         this.inProcessBlocks = false;
@@ -196,7 +195,6 @@ class Monitor {
         this.connection = new Connection({
             receivedAbi: () => this.connection.requestBlocks({
                 fetch_block: false,
-                fetch_block_state: false,
                 fetch_traces: false,
                 fetch_deltas: true,
             }),
@@ -352,7 +350,6 @@ class FillPostgress {
                 start_block_num: this.head + 1,
                 have_positions,
                 fetch_block: false,
-                fetch_block_state: false,
                 fetch_traces: false,
                 fetch_deltas: true,
             });
