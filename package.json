@@ -5,6 +5,7 @@
   "author": "<todd.fleming@block.one>",
   "license": "MIT",
   "dependencies": {
+    "commander": "^2.19.0",
     "eosjs2": "/Users/toddfleming/eosjs2",
     "node-fetch": "^2.2.0",
     "pg": "^7.4.3",

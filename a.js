@@ -30,7 +30,7 @@ const sqlTypes = {
     time_point_sec: { name: 'varchar', convert: x => x },
     block_timestamp_type: { name: 'varchar', convert: x => x },
     checksum256: { name: 'varchar(64)', convert: x => x },
-    bytes: { name: 'bytea', convert: x => Serialize.arrayToHex },
+    bytes: { name: 'bytea', convert: x => '\\x' + Serialize.arrayToHex(x) },
 };
 
 function numberWithCommas(x) {
@@ -92,7 +92,7 @@ class Connection {
             if (k === 'packed_trx' && v instanceof Uint8Array)
                 return this.deserialize('transaction', v);
             if (v instanceof Uint8Array)
-                return "...";
+                return `(${v.length} bytes)`;
             return v;
         }, 4)
     }
@@ -318,19 +318,21 @@ class FillPostgress {
                 }
             }
             if (createSchema) {
-                await this.pool.query('start transaction;');
-                await this.pool.query(`create schema ${this.schema}`);
-                await this.pool.query(`create table ${this.schema}.received_blocks ("block_index" bigint, "block_id" varchar(64), primary key("block_index"));`);
-                await this.pool.query(`create table ${this.schema}.status ("head" bigint, "irreversible" bigint);`);
-                await this.pool.query(`create unique index on ${this.schema}.status ((true));`);
-                await this.pool.query(`insert into ${this.schema}.status values (0, 0);`);
+                let client = await this.pool.connect();
+                await client.query('start transaction;');
+                await client.query(`create schema ${this.schema}`);
+                await client.query(`create table ${this.schema}.received_blocks ("block_index" bigint, "block_id" varchar(64), primary key("block_index"));`);
+                await client.query(`create table ${this.schema}.status ("head" bigint, "irreversible" bigint);`);
+                await client.query(`create unique index on ${this.schema}.status ((true));`);
+                await client.query(`insert into ${this.schema}.status values (0, 0);`);
                 for (let abiTable of this.connection.abi.tables) {
                     let sqlTable = this.sqlTables.get(abiTable.name);
                     let pk = '"block_index"' + abiTable.key_names.map(x => ',"' + x + '"').join('');
                     let query = `create table ${this.schema}.${sqlTable.name} (${sqlTable.fields.map(({ name, type }) => `"${name}" ${type.name}`).join(', ')}, primary key(${pk}));`;
-                    await this.pool.query(query);
+                    await client.query(query);
                 }
-                await this.pool.query('commit;');
+                await client.query('commit;');
+                client.release();
             }
         } catch (e) {
             console.log(e);
@@ -371,6 +373,8 @@ class FillPostgress {
             this.numRows = 0;
             console.log(`block ${numberWithCommas(block_num)}`)
         }
+        // if (block_num >= 500)
+        //     process.exit(1);
         try {
             if (this.head && block_num > this.head + 1)
                 throw new Error(`Skipped block(s): head = ${this.head}, received = ${block_num}`);
@@ -378,18 +382,21 @@ class FillPostgress {
             if (switchForks)
                 console.log(`Switch forks: old head = ${this.head}, new head = ${block_num}`);
 
-            await this.pool.query('start transaction;');
+            if (!this.insertClient)
+                this.insertClient = await this.pool.connect();
+            await this.insertClient.query('start transaction;');
             this.head = block_num;
             this.irreversible = response.last_irreversible.block_num;
-            await this.pool.query(`update ${this.schema}.status set head=$1, irreversible=$2;`, [this.head, this.irreversible]);
+            await this.insertClient.query(`update ${this.schema}.status set head=$1, irreversible=$2;`, [this.head, this.irreversible]);
 
             if (switchForks) {
-                await this.pool.query(`delete from ${this.schema}.received_blocks where block_index >= $1;`, [block_num]);
+                await this.insertClient.query(`delete from ${this.schema}.received_blocks where block_index >= $1;`, [block_num]);
                 for (let x of this.sqlTables)
-                    await this.pool.query(`delete from ${this.schema}."${x[1].name}" where block_index >= $1;`, [block_num]);
+                    await this.insertClient.query(`delete from ${this.schema}."${x[1].name}" where block_index >= $1;`, [block_num]);
             }
-            await this.pool.query(`insert into ${this.schema}.received_blocks values ($1, $2);`, [block_num, response.this_block.block_id]);
+            await this.insertClient.query(`insert into ${this.schema}.received_blocks values ($1, $2);`, [block_num, response.this_block.block_id]);
 
+            let promises = [];
             for (let [_, delta] of deltas) {
                 let sqlTable = this.sqlTables.get(delta.name);
                 let queries = [];
@@ -397,20 +404,24 @@ class FillPostgress {
                     let values = sqlTable.fields.map(({ name, type }) => type.convert(data[name]));
                     values[0] = block_num;
                     values[1] = present;
-                    queries.push([sqlTable.insert, values]);
+                    queries.push({
+                        name: delta.name,
+                        text: sqlTable.insert,
+                        values
+                    });
                 });
-                for (let [query, value] of queries) {
+                this.numRows += queries.length;
+                for (let query of queries) {
                     try {
-                        await this.pool.query(query, value);
-                        this.numRows += queries.length;
+                        await this.insertClient.query(query);
                     } catch (e) {
-                        console.log(query, value);
+                        console.log(query);
                         console.log(e);
                         process.exit(1);
                     }
                 }
             }
-            await this.pool.query('commit;');
+            await this.insertClient.query('commit;');
         } catch (e) {
             console.log(e);
             process.exit(1);
