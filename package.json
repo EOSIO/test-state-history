@@ -6,7 +6,7 @@
   "license": "MIT",
   "dependencies": {
     "commander": "^2.19.0",
-    "eosjs2": "/Users/toddfleming/eosjs2",
+    "eosjs": "./external/eosjs",
     "node-fetch": "^2.2.0",
     "pg": "^7.4.3",
     "pg-copy-streams": "^1.2.0",

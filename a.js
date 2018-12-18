@@ -1,8 +1,8 @@
 const WebSocket = require('ws');
-const { Serialize } = require('eosjs2');
+const { Serialize } = require('eosjs');
 const fetch = require('node-fetch');
 const { TextDecoder, TextEncoder } = require('text-encoding');
-const abiAbi = require('./node_modules/eosjs2/src/abi.abi.json');
+const abiAbi = require('./node_modules/eosjs/src/abi.abi.json');
 const pg = require('pg');
 const copyFrom = require('pg-copy-streams').from;
 const zlib = require('zlib');
