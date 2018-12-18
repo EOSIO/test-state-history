@@ -1,0 +1,4 @@
+[submodule "external/eosjs"]
+	path = external/eosjs
+	url = git@github.com:EOSIO/eosjs.git
+	branch = develop
