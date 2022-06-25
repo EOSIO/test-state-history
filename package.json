@@ -7,7 +7,7 @@
   "dependencies": {
     "commander": "^2.19.0",
     "eosjs": "./external/eosjs",
-    "node-fetch": "^2.2.0",
+    "node-fetch": "^2.6.7",
     "pg": "^7.4.3",
     "text-encoding": "^0.6.4",
     "ws": "^6.0.0"
